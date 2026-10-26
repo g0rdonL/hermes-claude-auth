@@ -159,6 +159,7 @@ lives at `$LOCALAPPDATA/hermes/patches/sitecustomize.py` (outside any repo).
 8. **Temperature fix**: Strips non-default `temperature` on Opus 4.6 adaptive thinking, which otherwise rejects with HTTP 400
 9. **Account metadata**: Maps `~/.claude.json::oauthAccount.accountUuid` to `metadata.user_id` (Anthropic rejected the older `account_uuid` key with HTTP 400 on 2026-04-29)
 10. **Window-aware rate-limit auto-wait** (v1.5.9+): when Anthropic returns HTTP 429 mid-agent, reads the `anthropic-ratelimit-unified-{5h,1d,7d}-status` / `-reset` headers to identify which subscription window tripped, picks the **longest** waiting window (sleeping through a 7d reset also clears 5h), and applies a **per-window** safety cap (`HERMES_RL_AUTOWAIT_MAX_5H_S`=6h, `_1D_S`=26h, `_7D_S`=7.5d). The legacy 6h cap is kept as the fallback when no window-specific status is present. Per-window caps can be tuned via env vars.
+11. **API credits fallback** (v1.8.0+): a subscription-window 429 (unified headers present, OAuth/bearer client) retries the same SDK call with an `x-api-key` credits client, with OAuth-only kwargs stripped; the exhaustion window is remembered so later calls route straight to credits until the window resets.
 
 Installed through a `.pth` file in the venv's site-packages that imports a small bootstrap module at interpreter startup, which in turn registers a `MetaPathFinder` hook for `agent.anthropic_adapter`. No source modifications.
 
@@ -196,6 +197,51 @@ call/exception behaviour is preserved.
 
 Ported from kristianvast/hermes-claude-auth PR #27 (window-aware auto-wait);
 the fingerprint parity fix below from PR #21.
+
+## API credits fallback (pay-per-token after subscription limits are used up)
+
+Sleeping through a 7-day window reset is not always acceptable.  When a
+request billed to the Claude subscription returns HTTP 429 with the unified
+subscription-window headers, this patch (v1.8.0+) transparently **retries
+the same call with an `x-api-key`** — pay-per-token API credits, e.g. the
+Claude SDK / Agent API monthly credit pack — so the agent keeps working
+while the subscription window recovers.
+
+The interception point is the Anthropic SDK's `Messages.create` / `Messages.
+stream` resource methods, which sits *below* hermes's dispatch layer: every
+call path (interruptible worker, direct/cron inline calls, streaming,
+auxiliary vision client) is covered, and return values stay SDK-native so
+hermes consumes them unchanged.  Behaviour:
+
+1. Only a **genuine subscription-quota 429** (unified `anthropic-ratelimit-
+   unified-*` headers present) triggers the fallback.  Headerless
+   third-party-detection 429s and non-429 errors propagate untouched.
+2. The retry goes to a cached `anthropic.Anthropic(api_key=...)` client with
+   the OAuth-only wire decorations stripped (billing-header system entry,
+   `metadata.user_id`, `extra_headers`, `extra_query`, `extra_body`).  The
+   original kwargs dict is never mutated, so the post-reset OAuth retry
+   still carries a valid billing header.
+3. The exhaustion is recorded until the **longest** window reset, so
+   subsequent calls route straight to credits without burning a doomed
+   OAuth request first.  When the deadline passes, the subscription is
+tried   again; a fresh 429 re-arms the fallback.
+4. Clients that already authenticate with `x-api-key` (credits as primary)
+   are never redirected.
+5. If the credits call fails (e.g. credits exhausted too), the **original
+   429 propagates**, so the subscription auto-wait above still applies.
+
+| Env var | Default | Meaning |
+|---------|---------|---------|
+| `HERMES_API_FALLBACK` | `1` | `0` disables the fallback entirely |
+| `HERMES_API_FALLBACK_API_KEY` | — | credits key; falls back to `ANTHROPIC_API_KEY` |
+| `HERMES_API_FALLBACK_BASE_URL` | — | optional base URL/proxy for the credits client |
+
+Example (`~/.hermes/.env`):
+
+```
+HERMES_API_FALLBACK=1
+HERMES_API_FALLBACK_API_KEY=sk-ant-...
+```
 
 ## Fingerprint parity (avoids "extra usage" billing)
 
@@ -443,6 +489,13 @@ Not merged:
     window-specific status header (default `21600` = 6h).
   Setting any of the `MAX_*_S` vars to a value `<= 0` falls back to the
   default; to *disable* auto-wait entirely, use `HERMES_RL_AUTOWAIT=0`.
+- **Want API credits to carry the load after subscription limits hit**
+  (v1.8.0+): set `HERMES_API_FALLBACK_API_KEY` (or just `ANTHROPIC_API_KEY`)
+  in `~/.hermes/.env`.  Subscription-window 429s then retry on `x-api-key`
+  billing instead of sleeping, and resume subscription billing after the
+  window resets.  Look for `[api-fallback] ... retrying with API credits` in
+  the gateway log to confirm it engaged; `HERMES_API_FALLBACK=0` turns it
+  off.
 
 ## Credits
 - [griffinmartin/opencode-claude-auth](https://github.com/griffinmartin/opencode-claude-auth), the original TypeScript implementation for opencode (MIT)

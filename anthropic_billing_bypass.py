@@ -11,6 +11,21 @@ ports its bypass behaviors to Python.
 
 Version history
 ---------------
+- 1.8.0 (2026-10-26): API-credits fallback.  When a request billed to the
+  Claude subscription returns HTTP 429 with the unified subscription-window
+  headers (``anthropic-ratelimit-unified-*``), the call is transparently
+  retried against ``api.anthropic.com`` with an ``x-api-key`` (pay-per-token
+  credits, e.g. the Claude SDK's monthly credit pack) instead of sleeping for
+  hours.  Intercepts ``anthropic.resources.messages.Messages.create`` /
+  ``.stream`` so every hermes call path (interruptible, direct/cron,
+  streaming, auxiliary) is covered and return types stay SDK-native.  While a
+  window is marked exhausted, calls route straight to credits without burning
+  a failed OAuth request first; when the window resets, subscription billing
+  resumes automatically.  Headerless (third-party-detection) 429s never
+  trigger the fallback, and if the credits call fails the original 429
+  propagates so the existing auto-wait still applies.  Tunables:
+  ``HERMES_API_FALLBACK`` (default 1), ``HERMES_API_FALLBACK_API_KEY``
+  (falls back to ``ANTHROPIC_API_KEY``), ``HERMES_API_FALLBACK_BASE_URL``.
 - 1.7.0 (2026-08-18): Community PR integration sweep.  Fingerprint re-synced
   to upstream's current ``ccVersion`` 2.1.217 (was pinned at 2.1.112 while
   the real CLI shipped 2.1.234): system identity reverted to upstream's
@@ -112,7 +127,7 @@ References
 
 from __future__ import annotations
 
-__version__ = "1.7.0"
+__version__ = "1.8.0"
 
 import hashlib
 import inspect
@@ -1869,6 +1884,273 @@ def install_rate_limit_autowait(run_agent_module: Any = None) -> bool:
     return True
 
 
+# ─────────────────────────────────────────────────────────────────────────
+# API-credits fallback (x-api-key pay-per-token after subscription 429)
+# ==================================================================
+# When a request billed to the Claude Max/Pro subscription hits a usage
+# window (5h / 1d / 7d), Anthropic returns HTTP 429 carrying the
+# ``anthropic-ratelimit-unified-*-{status,reset}`` headers.  Without this
+# patch the only options are sleeping until the window resets (auto-wait
+# above) or abandoning the run.  This fallback transparently retries the
+# same call with an ``x-api-key`` (pay-per-token credits — e.g. the Claude
+# SDK / Agent API monthly credit pack) so the agent keeps working while the
+# subscription window recovers.
+#
+# Interception point: the Anthropic SDK's ``Messages.create`` / ``Messages.
+# stream`` resource methods.  That sits *below* hermes's dispatch layer, so
+# every call path (interruptible worker, direct/cron inline, streaming,
+# auxiliary vision client) is covered, and the return values are SDK-native
+# (``Message`` / ``Stream``) which hermes already knows how to consume.
+#
+# Behaviour:
+#   1. A 429 carrying unified subscription-window headers (a genuine quota
+#      hit, NOT the headerless third-party-detection 429) retries the call
+#      against a cached ``anthropic.Anthropic(api_key=...)`` client with the
+#      OAuth-only wire decorations stripped (billing-header system entry,
+#      ``metadata.user_id``, ``extra_headers``, ``extra_query``,
+#      ``extra_body``).
+#   2. The exhaustion is recorded until the longest window reset (+buffer,
+#      capped) so subsequent calls route straight to credits without first
+#      burning a doomed OAuth request.  When the deadline passes the next
+#      call tries the subscription again; a fresh 429 re-arms the fallback.
+#   3. If the credits call fails (e.g. credits exhausted too), the ORIGINAL
+#      429 is re-raised so the subscription auto-wait still applies.
+#   4. Clients that already authenticate with ``x-api-key`` (credit billing
+#      as primary) are never redirected — the fallback only engages for
+#      OAuth/bearer clients.
+#
+# Tunables (env):
+#   HERMES_API_FALLBACK            "1"/"0"  enable/disable        (default 1)
+#   HERMES_API_FALLBACK_API_KEY    str      credits key; falls back to
+#                                           ANTHROPIC_API_KEY
+#   HERMES_API_FALLBACK_BASE_URL   str      optional proxy/base URL for the
+#                                           credits client
+#
+# Idempotent.  Never breaks the call path: any failure inside the fallback
+# logic re-raises the original exception.
+
+import threading as _threading
+
+_FB_LOCK = _threading.Lock()
+_FB_STATE: Dict[str, Any] = {"until": 0.0, "client": None, "client_failed": False}
+_FB_ORIG: Dict[str, Any] = {}
+
+
+def _fb_enabled() -> bool:
+    return str(os.environ.get("HERMES_API_FALLBACK", "1")).strip().lower() not in {
+        "0", "false", "no", "off",
+    }
+
+
+def _fb_api_key() -> "Optional[str]":
+    """The credits key: explicit override, else ANTHROPIC_API_KEY."""
+    key = (
+        os.environ.get("HERMES_API_FALLBACK_API_KEY")
+        or os.environ.get("ANTHROPIC_API_KEY")
+        or ""
+    ).strip()
+    return key or None
+
+
+def _fb_available() -> bool:
+    return _fb_enabled() and _fb_api_key() is not None
+
+
+def _fb_client_is_oauth(client: Any) -> bool:
+    """True when the SDK client bills the subscription (bearer/OAuth).
+
+    An ``x-api-key`` client is already pay-per-token — redirecting it to the
+    fallback key would be a no-op at best and a billing surprise at worst.
+    """
+    if client is None:
+        return False
+    api_key = getattr(client, "api_key", None)
+    if api_key:
+        return False
+    auth_token = getattr(client, "auth_token", None)
+    if auth_token:
+        return True
+    # Unknown/facade client: inspect the underlying httpx default headers.
+    hc = getattr(client, "_client", None)
+    headers = getattr(hc, "headers", None) or {}
+    try:
+        lowered = {str(k).lower() for k in dict(headers)}
+    except Exception:
+        lowered = set()
+    return "x-api-key" not in lowered
+
+
+def _fb_is_quota_429(exc: Exception) -> bool:
+    """True only for a genuine subscription-quota 429.
+
+    Requires at least one ``anthropic-ratelimit-unified-*`` header, which
+    excludes the headerless third-party-detection 429 (that one can never be
+    cleared by switching credentials).
+    """
+    if not _rl_is_rate_limit_error(exc):
+        return False
+    headers = _rl_parse_headers(exc)
+    return any(k.startswith("anthropic-ratelimit-unified-") for k in headers)
+
+
+def _fb_clean_kwargs(kwargs: Dict[str, Any]) -> Dict[str, Any]:
+    """Copy kwargs with OAuth-only wire decorations stripped for x-api-key
+    billing.  Never mutates the caller's dict — hermes reuses ``api_kwargs``
+    across retries and a mutation would send a billing-header-less OAuth
+    request after the window resets (third-party detection)."""
+    clean = {
+        k: v for k, v in kwargs.items()
+        if k not in ("extra_headers", "extra_query", "extra_body")
+    }
+    system = kwargs.get("system")
+    if isinstance(system, list):
+        filtered = [
+            entry for entry in system
+            if not (
+                isinstance(entry, dict)
+                and str(entry.get("text") or "").startswith(_BILLING_PREFIX)
+            )
+        ]
+        if len(filtered) != len(system):
+            clean["system"] = filtered
+    metadata = kwargs.get("metadata")
+    if isinstance(metadata, dict):
+        md = {k: v for k, v in metadata.items() if k != "user_id"}
+        if md:
+            clean["metadata"] = md
+        else:
+            clean.pop("metadata", None)
+    return clean
+
+
+def _fb_get_client() -> Any:
+    with _FB_LOCK:
+        client = _FB_STATE.get("client")
+        if client is not None:
+            return client
+        if _FB_STATE.get("client_failed"):
+            raise RuntimeError("api-credits fallback client unavailable")
+    import anthropic  # deferred: only the hermes venv ships the SDK
+    base_url = os.environ.get("HERMES_API_FALLBACK_BASE_URL") or None
+    client = anthropic.Anthropic(api_key=_fb_api_key(), base_url=base_url)
+    with _FB_LOCK:
+        _FB_STATE["client"] = client
+    return client
+
+
+def _fb_mark_exhausted(window: "str | None", reset: "float | None") -> None:
+    """Remember that the subscription window is exhausted until its reset."""
+    if reset is None:
+        return
+    buffer_s = _rl_env_int("HERMES_RL_AUTOWAIT_BUFFER_S", 5)
+    cap = _rl_window_cap(window)
+    until = time.time() + min(reset + buffer_s, float(cap))
+    with _FB_LOCK:
+        if until > _FB_STATE["until"]:
+            _FB_STATE["until"] = until
+
+
+def _fb_exhausted_remaining() -> float:
+    with _FB_LOCK:
+        return max(0.0, _FB_STATE["until"] - time.time())
+
+
+def _fb_call(is_stream: bool, kwargs: Dict[str, Any]) -> Any:
+    """Issue the call against the credits client using the ORIGINAL unwrapped
+    resource method (``_FB_ORIG``) so the fallback request never re-enters
+    this wrapper (recursion guard)."""
+    kind = "stream" if is_stream else "create"
+    original = _FB_ORIG.get(kind)
+    if original is None:
+        raise RuntimeError(f"api-credits fallback original for {kind!r} missing")
+    resource = _fb_get_client().messages
+    return original(resource, **_fb_clean_kwargs(kwargs))
+
+
+def _fb_wrap_method(original: Any, *, is_stream: bool) -> Any:
+    kind = "stream" if is_stream else "create"
+
+    def wrapper(self: Any, *args: Any, **kwargs: Any) -> Any:
+        if not _fb_available() or not _fb_client_is_oauth(getattr(self, "_client", None)):
+            return original(self, *args, **kwargs)
+
+        # Preemptive: subscription window already known-exhausted — go
+        # straight to credits without burning a doomed OAuth request.
+        if _fb_exhausted_remaining() > 0:
+            try:
+                return _fb_call(is_stream, kwargs)
+            except Exception:
+                logger.warning(
+                    "[api-fallback] credits call failed during exhausted window",
+                    exc_info=True,
+                )
+                raise
+
+        try:
+            return original(self, *args, **kwargs)
+        except Exception as exc:
+            if not _fb_is_quota_429(exc):
+                raise
+            window, reset = _rl_seconds_until_reset(exc)
+            _fb_mark_exhausted(window, reset)
+            logger.warning(
+                "[api-fallback] Claude subscription quota exhausted "
+                "(window=%s, reset≈%s) — retrying with API credits (x-api-key)",
+                window or "?",
+                _rl_fmt_eta(reset) if reset is not None else "?",
+            )
+            try:
+                return _fb_call(is_stream, kwargs)
+            except Exception:
+                # Credits call failed — propagate the ORIGINAL 429 so the
+                # subscription auto-wait still applies.  (``raise exc``, not
+                # a bare ``raise``: the inner handler's active exception is
+                # the credits failure.)
+                logger.warning(
+                    "[api-fallback] credits retry failed; original "
+                    "rate-limit propagates (auto-wait may still apply)",
+                    exc_info=True,
+                )
+                raise exc
+
+    wrapper.__name__ = getattr(original, "__name__", kind)
+    wrapper.__qualname__ = getattr(original, "__qualname__", wrapper.__name__)
+    wrapper.__doc__ = getattr(original, "__doc__", None)
+    wrapper.__wrapped__ = original  # type: ignore[attr-defined]
+    return wrapper
+
+
+def install_api_credits_fallback() -> bool:
+    """Patch the Anthropic SDK ``Messages`` resource so subscription-window
+    429s retry on API-credits (x-api-key) auth.
+
+    Idempotent.  Returns False when the SDK resource isn't importable (API
+    drift) — the original behaviour is untouched.
+    """
+    try:
+        from anthropic.resources.messages import Messages  # type: ignore[import-not-found]
+    except Exception as exc:
+        logger.debug("[api-fallback] anthropic Messages resource not importable: %s", exc)
+        return False
+
+    if getattr(Messages, "_API_CREDITS_FALLBACK_PATCHED", False):
+        return True
+
+    installed = False
+    for name, is_stream in (("create", False), ("stream", True)):
+        original = getattr(Messages, name, None)
+        if not callable(original):
+            continue
+        _FB_ORIG[name] = original
+        setattr(Messages, name, _fb_wrap_method(original, is_stream=is_stream))
+        installed = True
+
+    if installed:
+        Messages._API_CREDITS_FALLBACK_PATCHED = True  # type: ignore[attr-defined]
+        logger.info("[api-fallback] API-credits fallback installed on Messages")
+    return installed
+
+
 def _install_pool_select_hook() -> None:
     """Wrap CredentialPool.select() to call set_active_account_uuid when
     an anthropic pool entry with an account_uuid field is selected.
@@ -1929,6 +2211,12 @@ def apply_patches(anthropic_adapter_module: Any = None) -> bool:
 
     if getattr(aa, "_CLAUDE_CODE_BYPASS_APPLIED", False):
         _install_thinking_replay_classifier_patch()
+        try:
+            install_api_credits_fallback()
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning(
+                "install_api_credits_fallback raised %s: %s", type(exc).__name__, exc
+            )
         return True
 
     # 1. Add the OAuth-only beta flags.
@@ -2010,6 +2298,18 @@ def apply_patches(anthropic_adapter_module: Any = None) -> bool:
     except Exception as exc:  # pragma: no cover - defensive
         logger.warning(
             "install_rate_limit_autowait raised %s: %s", type(exc).__name__, exc
+        )
+
+    # API-credits fallback: subscription-window 429s retry on x-api-key
+    # billing.  Never fatal: a failure here must not break the bypass.
+    try:
+        if install_api_credits_fallback():
+            sys.stderr.write(
+                "[anthropic_billing_bypass] API-credits fallback installed\n"
+            )
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning(
+            "install_api_credits_fallback raised %s: %s", type(exc).__name__, exc
         )
 
     _install_pool_select_hook()
